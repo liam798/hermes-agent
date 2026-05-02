@@ -5880,6 +5880,17 @@ class AIAgent:
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
+                sdk_event_order_error = "Expected to have received `response.created` before" in err_text
+                if sdk_event_order_error:
+                    logger.debug(
+                        "Responses stream rejected backend-specific event order; falling back to raw SSE. %s error=%s",
+                        self._client_log_context(),
+                        exc,
+                    )
+                    return self._run_codex_raw_sse_fallback(
+                        api_kwargs,
+                        on_first_delta=on_first_delta,
+                    )
                 if missing_completed and attempt < max_stream_retries:
                     logger.debug(
                         "Responses stream closed before completion (attempt %s/%s); retrying. %s",
@@ -5973,6 +5984,137 @@ class AIAgent:
         if terminal_response is not None:
             return terminal_response
         raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
+
+    def _run_codex_raw_sse_fallback(self, api_kwargs: dict, on_first_delta: callable = None):
+        """Fallback for Responses-compatible backends that emit SDK-unknown SSE events."""
+        import json as _json
+        import httpx as _httpx
+
+        def _to_namespace(value):
+            if isinstance(value, dict):
+                return SimpleNamespace(**{k: _to_namespace(v) for k, v in value.items()})
+            if isinstance(value, list):
+                return [_to_namespace(v) for v in value]
+            return value
+
+        url = f"{self.base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        timeout = get_provider_request_timeout(self.provider, self.model)
+        collected_output_items: list = []
+        collected_text_deltas: list = []
+        terminal_response = None
+        first_delta_fired = False
+        event_name = None
+        data_lines: list[str] = []
+
+        def _handle_event(name, data_text):
+            nonlocal terminal_response, first_delta_fired
+            if not data_text or data_text == "[DONE]":
+                return
+            try:
+                payload = _json.loads(data_text)
+            except Exception:
+                logger.debug("Codex raw SSE fallback skipped non-JSON event %s", name)
+                return
+
+            event_type = payload.get("type") or name
+            if event_type == "codex.rate_limits":
+                logger.debug("Codex raw SSE fallback ignored codex.rate_limits event")
+                return
+
+            if event_type == "response.output_item.done":
+                done_item = payload.get("item")
+                if done_item is not None:
+                    collected_output_items.append(_to_namespace(done_item))
+                return
+
+            if event_type == "response.output_text.delta":
+                delta = payload.get("delta") or ""
+                if delta:
+                    collected_text_deltas.append(delta)
+                    if not first_delta_fired:
+                        first_delta_fired = True
+                        if on_first_delta:
+                            try:
+                                on_first_delta()
+                            except Exception:
+                                pass
+                    self._fire_stream_delta(delta)
+                return
+
+            if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                delta = payload.get("delta") or ""
+                if delta:
+                    self._fire_reasoning_delta(delta)
+                return
+
+            if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                response_obj = payload.get("response")
+                if response_obj is not None:
+                    terminal_response = _to_namespace(response_obj)
+
+        with _httpx.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=api_kwargs,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                self._touch_activity("receiving raw SSE response")
+                if self._interrupt_requested:
+                    break
+                if line.startswith("event:"):
+                    event_name = line[len("event:"):].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].strip())
+                    continue
+                if line.strip():
+                    continue
+                if data_lines:
+                    _handle_event(event_name, "\n".join(data_lines))
+                event_name = None
+                data_lines = []
+            if data_lines:
+                _handle_event(event_name, "\n".join(data_lines))
+
+        if terminal_response is not None:
+            _out = getattr(terminal_response, "output", None)
+            if isinstance(_out, list) and not _out:
+                if collected_output_items:
+                    terminal_response.output = collected_output_items
+                elif collected_text_deltas:
+                    assembled = "".join(collected_text_deltas)
+                    terminal_response.output = [SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )]
+            return terminal_response
+
+        if collected_output_items:
+            return SimpleNamespace(output=collected_output_items, status="completed")
+
+        if collected_text_deltas:
+            assembled = "".join(collected_text_deltas)
+            return SimpleNamespace(
+                output=[SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )],
+                status="completed",
+            )
+
+        raise RuntimeError("Raw Responses SSE fallback did not emit output.")
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider != "openai-codex":
