@@ -11830,11 +11830,18 @@ class GatewayRunner:
         #
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
+        # - Feishu/Lark can create a message thread by replying to the user's
+        #   message with reply_in_thread=true; keep tool-progress chatter in
+        #   that thread while the final answer remains a normal chat message.
         # - Telegram uses message_thread_id only for forum topics; passing a
         #   normal DM/group message id as thread_id causes send failures
         # - Other platforms should use explicit source.thread_id only
+        _progress_reply_to = None
         if source.platform == Platform.SLACK:
             _progress_thread_id = source.thread_id or event_message_id
+        elif source.platform == Platform.FEISHU and event_message_id:
+            _progress_thread_id = source.thread_id or event_message_id
+            _progress_reply_to = event_message_id
         else:
             _progress_thread_id = source.thread_id
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
@@ -11951,15 +11958,30 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                             can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=full_text,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
                         else:
                             # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                reply_to=_progress_reply_to,
+                                metadata=_progress_metadata,
+                            )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
@@ -12060,6 +12082,7 @@ class GatewayRunner:
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _status_reply_to = _progress_reply_to
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -12069,6 +12092,7 @@ class GatewayRunner:
                     _status_adapter.send(
                         _status_chat_id,
                         message,
+                        reply_to=_status_reply_to,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,
@@ -12234,6 +12258,7 @@ class GatewayRunner:
                         _status_adapter.send(
                             _status_chat_id,
                             text,
+                            reply_to=_status_reply_to,
                             metadata=_status_thread_metadata,
                         ),
                         _loop_for_step,
@@ -12333,6 +12358,7 @@ class GatewayRunner:
                         _status_adapter.send(
                             _status_chat_id,
                             message,
+                            reply_to=_status_reply_to,
                             metadata=_status_thread_metadata,
                         ),
                         _loop_for_step,
@@ -12927,6 +12953,7 @@ class GatewayRunner:
                     await _notify_adapter.send(
                         source.chat_id,
                         f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        reply_to=_status_reply_to,
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:
@@ -13021,6 +13048,7 @@ class GatewayRunner:
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
                                     f"You can continue waiting or use /reset.",
+                                    reply_to=_status_reply_to,
                                     metadata=_status_thread_metadata,
                                 )
                             except Exception as _warn_err:
